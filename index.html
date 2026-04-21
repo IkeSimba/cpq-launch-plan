@@ -149,9 +149,10 @@
   <!-- Share / cross-browser link bar -->
   <div style="background:#1e2336;border:1px solid #2d3748;border-radius:10px;padding:12px 16px;margin-bottom:20px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
     <span style="font-size:0.78rem;color:#64748b;font-weight:700;white-space:nowrap;">🔗 YOUR PROGRESS LINK</span>
-    <input id="share-url" readonly style="flex:1;min-width:180px;background:#0f1117;border:1px solid #2d3748;border-radius:6px;padding:6px 10px;font-size:0.75rem;color:#94a3b8;font-family:inherit;cursor:pointer;" value="Check off a task to generate your shareable link…" onclick="this.select()">
+    <input id="share-url" readonly style="flex:1;min-width:180px;background:#0f1117;border:1px solid #2d3748;border-radius:6px;padding:6px 10px;font-size:0.75rem;color:#94a3b8;font-family:inherit;cursor:pointer;" value="Setting up cloud sync…" onclick="this.select()">
     <button id="copy-share-btn" onclick="copyShareUrl()" style="background:#0070d2;color:#fff;border:none;padding:7px 14px;border-radius:6px;font-size:0.76rem;font-weight:700;cursor:pointer;white-space:nowrap;">🔗 Copy Link</button>
-    <span style="font-size:0.71rem;color:#4b5563;flex-basis:100%;">Paste this URL into any browser to restore your exact progress</span>
+    <span id="sync-status" style="font-size:0.75rem;font-weight:600;white-space:nowrap;color:#64748b;">☁️ Connecting…</span>
+    <span style="font-size:0.71rem;color:#4b5563;flex-basis:100%;">Paste this URL in any browser — your progress syncs automatically across all devices</span>
   </div>
 
   <div class="tabs">
@@ -467,9 +468,16 @@ DMs are open. 👇
 </div>
 
 <script>
-  const LS_KEY = 'ike-cpq-plan-state';
+  // ── Config ───────────────────────────────────────────────────────────────
+  const LS_BIN_KEY  = 'ike-cpq-bin-id';
+  const JSONBIN_KEY = '$2a$10$s9VbHVEBGskXvECr6GpRG.M2RvvFHD2kNWzSX5/VXS73P2X51R5Vy';
+  const JSONBIN_URL = 'https://api.jsonbin.io/v3/b';
 
-  // ── Encode / decode state ────────────────────────────────────────────────
+  let binId      = null;
+  let saveTimer  = null;
+  let syncStatus = null;
+
+  // ── State helpers ────────────────────────────────────────────────────────
   function collectState() {
     const tasks = {}, cards = {};
     document.querySelectorAll('.task-check').forEach((el, i) => { tasks[i] = el.classList.contains('checked') ? 1 : 0; });
@@ -486,33 +494,121 @@ DMs are open. 👇
     });
   }
 
-  // ── Persist: localStorage (same browser) + URL hash (any browser) ────────
-  function saveState() {
+  // ── Sync status indicator ────────────────────────────────────────────────
+  function setStatus(msg, color) {
+    if (!syncStatus) return;
+    syncStatus.textContent = msg;
+    syncStatus.style.color = color || '#64748b';
+  }
+
+  // ── JSONBin API ──────────────────────────────────────────────────────────
+  async function createBin(state) {
+    try {
+      const res = await fetch(JSONBIN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_KEY, 'X-Bin-Name': 'ike-cpq-plan', 'X-Bin-Private': 'true' },
+        body: JSON.stringify(state)
+      });
+      const data = await res.json();
+      return data.metadata?.id || null;
+    } catch(e) { return null; }
+  }
+
+  async function saveToBin(state) {
+    if (!binId) return;
+    setStatus('☁️ Saving…', '#94a3b8');
+    try {
+      await fetch(`${JSONBIN_URL}/${binId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'X-Master-Key': JSONBIN_KEY },
+        body: JSON.stringify(state)
+      });
+      setStatus('✅ Synced', '#22d3ee');
+      setTimeout(() => setStatus('☁️ Cloud sync on', '#22d3ee'), 2000);
+    } catch(e) { setStatus('⚠️ Offline — saved locally', '#f97316'); }
+  }
+
+  async function loadFromBin(id) {
+    try {
+      const res = await fetch(`${JSONBIN_URL}/${id}/latest`, {
+        headers: { 'X-Master-Key': JSONBIN_KEY }
+      });
+      const data = await res.json();
+      return data.record || null;
+    } catch(e) { return null; }
+  }
+
+  // ── Debounced save ───────────────────────────────────────────────────────
+  function scheduleSync() {
     const state = collectState();
-    const encoded = btoa(JSON.stringify(state));
-    // 1. localStorage for instant same-browser reloads
-    try { localStorage.setItem(LS_KEY, encoded); } catch(e) {}
-    // 2. URL hash — copy this URL to open progress in any browser
-    history.replaceState(null, '', '#' + encoded);
-    updateShareBar(encoded);
+    // Always write localStorage instantly
+    try { localStorage.setItem(LS_BIN_KEY + '-state', JSON.stringify(state)); } catch(e) {}
+    // Debounce cloud save 800ms
+    clearTimeout(saveTimer);
+    setStatus('☁️ Saving…', '#94a3b8');
+    saveTimer = setTimeout(() => saveToBin(state), 800);
   }
 
-  function loadState() {
-    let encoded = null;
-    // Priority: URL hash first (allows cross-browser sharing), then localStorage
-    if (location.hash && location.hash.length > 1) {
-      encoded = location.hash.slice(1);
+  // ── Boot sequence ────────────────────────────────────────────────────────
+  async function boot() {
+    syncStatus = document.getElementById('sync-status');
+
+    // 1. Try to get binId from URL param first, then localStorage
+    const urlParams = new URLSearchParams(location.search);
+    const urlBinId  = urlParams.get('bin');
+    const lsBinId   = localStorage.getItem(LS_BIN_KEY);
+
+    binId = urlBinId || lsBinId || null;
+
+    if (binId) {
+      // Update URL to always carry the bin ID
+      if (!urlBinId) {
+        const newUrl = location.pathname + '?bin=' + binId;
+        history.replaceState(null, '', newUrl);
+      }
+      localStorage.setItem(LS_BIN_KEY, binId);
+      updateShareBar();
+      setStatus('☁️ Loading…', '#94a3b8');
+
+      // Load from cloud
+      const state = await loadFromBin(binId);
+      if (state) {
+        applyState(state);
+        setStatus('✅ Synced', '#22d3ee');
+        setTimeout(() => setStatus('☁️ Cloud sync on', '#22d3ee'), 2000);
+      } else {
+        // Fallback to localStorage state
+        try {
+          const local = localStorage.getItem(LS_BIN_KEY + '-state');
+          if (local) applyState(JSON.parse(local));
+        } catch(e) {}
+        setStatus('⚠️ Offline — loaded local', '#f97316');
+      }
     } else {
-      try { encoded = localStorage.getItem(LS_KEY); } catch(e) {}
+      // First ever visit — create a new bin
+      setStatus('☁️ Setting up sync…', '#94a3b8');
+      const initialState = collectState();
+      const newId = await createBin(initialState);
+      if (newId) {
+        binId = newId;
+        localStorage.setItem(LS_BIN_KEY, binId);
+        const newUrl = location.pathname + '?bin=' + binId;
+        history.replaceState(null, '', newUrl);
+        updateShareBar();
+        setStatus('✅ Cloud sync ready', '#22d3ee');
+        setTimeout(() => setStatus('☁️ Cloud sync on', '#22d3ee'), 2500);
+      } else {
+        setStatus('⚠️ Offline mode', '#f97316');
+      }
     }
-    if (!encoded) return;
-    try { applyState(JSON.parse(atob(encoded))); } catch(e) {}
+
+    updateProgress();
   }
 
-  // ── Share bar UI ─────────────────────────────────────────────────────────
-  function updateShareBar(encoded) {
+  // ── Share bar ────────────────────────────────────────────────────────────
+  function updateShareBar() {
     const el = document.getElementById('share-url');
-    if (el) el.value = location.href.split('#')[0] + '#' + encoded;
+    if (el && binId) el.value = location.origin + location.pathname + '?bin=' + binId;
   }
 
   function copyShareUrl() {
@@ -540,13 +636,13 @@ DMs are open. 👇
     const lbl = el.nextElementSibling;
     if (lbl) lbl.classList.toggle('checked');
     updateProgress();
-    saveState();        // synchronous localStorage write
+    scheduleSync();
   }
 
   function toggleCard(card) {
     card.classList.toggle('done');
     updateProgress();
-    saveState();        // synchronous localStorage write
+    scheduleSync();
   }
 
   // ── Progress bar ─────────────────────────────────────────────────────────
@@ -569,9 +665,8 @@ DMs are open. 👇
     });
   }
 
-  // ── Boot ─────────────────────────────────────────────────────────────────
-  loadState();
-  updateProgress();
+  // ── Start ─────────────────────────────────────────────────────────────────
+  boot();
 </script>
 </body>
 </html>
